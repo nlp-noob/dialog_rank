@@ -864,8 +864,6 @@ def main():
         # and the others will use the cache
 #        if args.local_rank not in [-1, 0]:
 #            torch.distributed.barrier()  
-
-
         ## additional information for negative sampling
         others = {}
 

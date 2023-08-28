@@ -1,5 +1,6 @@
 import json
 import argparse
+import os
 
 from tqdm import tqdm
 from msc_dataset import MSCTokenizer
@@ -65,10 +66,11 @@ def _gen_dataset(tagged_data, msc_tokenizer, window_size, resp_to_cluster_idx, r
     return dataset
         
 
-def gen_train_dataset(tagged_data, msc_tokenizer, valid_ratio, window_size, resp_to_cluster_idx, resp_to_star_info=None, use_best_stars=False):
+def gen_train_valid_dataset(tagged_data, msc_tokenizer, valid_ratio, window_size, resp_to_cluster_idx, resp_to_star_info=None, use_best_stars=False):
     valid_len = int(len(tagged_data) * valid_ratio)
     train_tagged_data = tagged_data[valid_len:]
     valid_tagged_data = tagged_data[:valid_len]
+    fix_index_list = [data_item["index"] for data_item in valid_tagged_data]
     print("Collating train data....")
     train_dataset = _gen_dataset(
             train_tagged_data,
@@ -78,6 +80,7 @@ def gen_train_dataset(tagged_data, msc_tokenizer, valid_ratio, window_size, resp
             resp_to_star_info=resp_to_star_info,
             use_best_stars=use_best_stars
             )
+
     print("Collating valid data....")
     valid_dataset = _gen_dataset(
             valid_tagged_data,
@@ -87,19 +90,39 @@ def gen_train_dataset(tagged_data, msc_tokenizer, valid_ratio, window_size, resp
             resp_to_star_info=resp_to_star_info,
             use_best_stars=use_best_stars
             )
-    return train_dataset, valid_dataset
+
+    return train_dataset, valid_dataset, fix_index_list
+
+
+def gen_train_dataset(tagged_data, fix_index_list, msc_tokenizer, valid_ratio, window_size, resp_to_cluster_idx, resp_to_star_info=None, use_best_stars=False):
+    train_tagged_data = []
+    for data_item in tagged_data:
+        if data_item["index"] in fix_index_list:
+            continue
+        else:
+            train_tagged_data.append(data_item)
+
+    train_dataset = _gen_dataset(
+            train_tagged_data,
+            msc_tokenizer,
+            window_size,
+            resp_to_cluster_idx,
+            resp_to_star_info=resp_to_star_info,
+            use_best_stars=use_best_stars
+            )
+    return train_dataset
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tagged_data_path", help="", type=str, default="./data/tag_data/tagged_data.json")
+    parser.add_argument("--tagged_data_path", help="exported from TagRankServer by export_data.py", type=str, default="./data/tagged_data.no_skipped.json")
     parser.add_argument("--window_size", help="", type=int, default=10)
     parser.add_argument("--valid_ratio", help="", type=float, default=0.1)
-    parser.add_argument("--train_out_path", help="", type=str, default="./data/tagged_train/train_v1.json")
-    parser.add_argument("--valid_out_path", help="", type=str, default="./data/tagged_train/valid_v1.json")
+    parser.add_argument("--train_out_path", help="", type=str, default="./data/tagged_train/train_v1.no_skipped.json")
+    parser.add_argument("--valid_out_path", help="fix valid data", type=str, default="./data/tagged_train/valid_v1.no_skipped.json")
     parser.add_argument("--resp_cluster_info_path", help="", type=str, default="data/tag_data/resp_to_cluster_idx_v9.json")
     parser.add_argument("--resp_star_info_path", help="", type=str, default="./data/tag_data/resp_to_star_info.json")
-    parser.add_argument("--use_best_stars", required=True, action="store_true")
+    parser.add_argument("--use_best_stars", action="store_true", default=False)
     args = parser.parse_args()
 
     with open(args.tagged_data_path, "r") as jf:
@@ -122,24 +145,40 @@ def main():
     tokenizer = get_dialog_tokenizer("distilbert", "distilbert-base-uncased")
     msc_tokenizer = MSCTokenizer([], tokenizer)
 
-    train_dataset, valid_dataset = gen_train_dataset(
-            tagged_data,
-            msc_tokenizer,
-            args.valid_ratio,
-            args.window_size,
-            resp_to_cluster_idx,
-            resp_to_star_info=resp_to_star_info,
-            use_best_stars=args.use_best_stars
-            )
-
+    if os.path.exists(args.valid_out_path):
+        with open(valid_out_path, "r") as jf:
+            valid_dataset = json.load(jf)
+        with open(valid_out_path + ".fix_index_list", "r") as jf:
+            fix_index_list = json.load(fix_index_list)
+        train_dataset = gen_train_dataset(
+                tagged_data,
+                fix_index_list,
+                msc_tokenizer,
+                args.window_size,
+                resp_to_cluster_idx,
+                resp_to_star_info=resp_to_star_info,
+                use_best_stars=args.use_best_stars,
+                )
+    else:
+        train_dataset, valid_dataset, fix_index_list = gen_train_valid_dataset(
+                tagged_data,
+                msc_tokenizer,
+                args.valid_ratio,
+                args.window_size,
+                resp_to_cluster_idx,
+                resp_to_star_info=resp_to_star_info,
+                use_best_stars=args.use_best_stars
+                )
+        with open(valid_out_path, "w") as fout:
+            json.dump(valid_dataset, fout)
+        with open(valid_out_path + ".fix_index_list", "w") as fout:
+            json.dump(fix_index_list, fout)
+ 
     console.print("train out path: {}".format(train_out_path), style="green")
     console.print("valid out path: {}".format(valid_out_path), style="green")
-    input()
 
     with open(train_out_path, "w") as fout:
         json.dump(train_dataset, fout)
-    with open(valid_out_path, "w") as fout:
-        json.dump(valid_dataset, fout)
 
 
 if __name__ == "__main__":

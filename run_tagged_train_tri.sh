@@ -1,7 +1,7 @@
 CUDA_VISIBLE_DEVICES=1 \
 python train_biencoder_with_mlm_tri_sampler_tagged_data.py \
-    --train_data_path ./data/tagged_train/train_v1.best_star.json \
-    --valid_data_path ./data/tagged_train/valid_v1.best_star.json \
+    --train_data_path ./data/tagged_train/train_v1.json \
+    --valid_data_path ./data/tagged_train/valid_v1.json \
     --output exp.distbert.b16.tri.tagged/ \
     --add_origin_in_tri \
     --add_origin_in_tri_rate 0.5 \
