@@ -1,8 +1,17 @@
-CUDA_VISIBLE_DEVICES=2 \
+CUDA_VISIBLE_DEVICES=1 \
 python train_biencoder_with_mlm.py \
-    --order_file data/orders.star1-2.1.json \
-    --output exp.distbert.b16 \
+    --train_data_path ./data/tagged_train/train_v1.json \
+    --valid_data_path ./data/tagged_train/valid_v1.json \
+    --output exp.distbert.b16.tri.tagged/ \
+    --add_origin_in_tri \
+    --add_origin_in_tri_rate 0.5 \
+    --n_p_size 2 \
+    --log_dir log/ \
+    --margin 1 \
+    --do_train \
     --do_eval \
+    --learning_rate 2e-5 \
+    --fp16 \
     --evaluate_during_training \
     --num_train_epochs 100 \
     --save_steps 0.5 \
@@ -13,4 +22,5 @@ python train_biencoder_with_mlm.py \
     --batch_size 16 \
     --mlm \
     --star_list_file data/star.list.220802.1-2 \
-    --other_cluster_num 0 \
+    --use_rs_loss \
+    --use_triplet_loss \

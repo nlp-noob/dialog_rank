@@ -1,4 +1,3 @@
-# The training version with NaiveIdentity Sampler
 import argparse
 import glob
 import logging
@@ -23,7 +22,6 @@ from tqdm import tqdm, trange
 from concurrent.futures import ThreadPoolExecutor
 from torch.nn.utils.rnn import pad_sequence
 from tod_model import MLMBiencoder
-from utils.n_p_sampler import RankingTaggedNegativeTripletSampler
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -33,7 +31,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-from msc_dataset import load_datasets, load_star_list, load_tagged_tri_dataset
+from msc_dataset import load_datasets, load_star_list
 from dialogbert_tokenizer import get_dialog_tokenizer
 from utils import misc, xlog
 
@@ -80,8 +78,7 @@ def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
 def test_dataloader(dataloader, tokenizer, is_training=True):
     # This function is written by hujun for the further understanding.
     if is_training:
-        #dataloader.sampler.set_epoch(0)
-        pass
+        dataloader.sampler.set_epoch(0)
 
     epoch_iterator = tqdm(dataloader, disable=-1 not in [-1, 0])
 
@@ -126,7 +123,18 @@ def test_dataloader(dataloader, tokenizer, is_training=True):
     groups = cluster_texts(cont_sentences, text_key=lambda x: x, debug=False, dist_thresh=0.85)
     console.print("The dedup len change is {} --> {}".format(len(cont_sentences), len(groups)))
 
+def batch_pad_collector_tri(batch: List[Tuple[List[int], List[int], List[int]]], pad_val=0):
+    item_size = len(batch[0])
 
+    items = [[torch.tensor(item[i]) for item in batch] \
+                for i in range(item_size)]
+
+    try:
+        items = [pad_sequence(item, batch_first=True, padding_value=pad_val) for item in items]
+    except:
+        import pdb; pdb.set_trace()
+
+    return items
     
 def batch_pad_collector(batch: List[Tuple[List[int], List[int], int]], pad_val=0):
     item_size = len(batch[0])
@@ -160,66 +168,7 @@ def save_checkpoint(args, model, optimizer, scheduler, tokenizer, global_step,
     torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
     logger.info("Saving optimizer and scheduler states to %s", output_dir)
 
-def get_acc(similarity_positive, similarity_negative):
-    bool_tensor = similarity_positive < similarity_negative
-    acc = torch.mean(bool_tensor.float())
-    return acc
     
-def find_n_p(input_cont, input_resp, p_index, n_index, index, n_p_size, add_origin_in_tri=False, batch_size=None, add_origin_in_tri_rate=None):
-    # search the n
-    found_cont_idx = []
-    found_p_idx = []
-    found_n_idx = []
-
-    if add_origin_in_tri:
-        n_p_size += batch_size
-        add_origin_cnt = int(add_origin_in_tri_rate * batch_size)
-    added_cnt = 0
-
-    for cont_idx in range(len(index)):
-        p_index_list = p_index[cont_idx]
-        n_index_list = n_index[cont_idx] # the n_indexes correspond to the resp_index
-        exist_p_idx_list = []
-        exist_n_idx_list = []
-
-
-        for p_index_item in p_index_list:
-            for idx, index_item in enumerate(index):
-                if index_item == p_index_item:
-                    exist_p_idx_list.append(idx)
-
-        for n_index_item in n_index_list:
-            for idx, index_item in enumerate(index):
-                if index_item == n_index_item:
-                    exist_n_idx_list.append(idx)
-
-        if add_origin_in_tri and len(exist_n_idx_list) > 0 and added_cnt < add_origin_cnt:
-            found_n_idx.insert(0, exist_n_idx_list[0])
-            found_p_idx.insert(0, cont_idx)
-            found_cont_idx.insert(0, cont_idx)
-            added_cnt += 1
-
-        for n_idx in exist_n_idx_list:
-            found_cont_idx.append(cont_idx)
-            found_n_idx.append(n_idx)
-            if len(exist_p_idx_list) > 0:
-                found_p_idx.append(exist_p_idx_list[0])
-                del(exist_p_idx_list[0])
-            else:
-                found_p_idx.append(cont_idx)
-
-    found_cont_idx = found_cont_idx[:n_p_size]
-    found_p_idx = found_p_idx[:n_p_size]
-    found_n_idx = found_n_idx[:n_p_size]
-
-    if len(found_n_idx) == 0:
-        return None, None, None
-
-    cont_tri = input_cont[found_cont_idx]
-    p_resp = input_resp[found_p_idx]
-    n_resp = input_resp[found_n_idx]
-    return cont_tri, p_resp, n_resp
-
 def train(args, trn_loader, dev_loader, model, tokenizer, others, tblog):
     """ Train the model """
     if args.max_steps > 0:
@@ -287,7 +236,7 @@ def train(args, trn_loader, dev_loader, model, tokenizer, others, tblog):
     steps_trained_in_current_epoch = 0
 
     tr_loss, logging_loss = 0.0, 0.0
-    loss_mlm, loss_tri = 0, 0
+    loss_mlm, loss_rs = 0, 0
     patience, best_loss = 0, 1e10
     xeloss = torch.nn.CrossEntropyLoss()
 
@@ -297,11 +246,9 @@ def train(args, trn_loader, dev_loader, model, tokenizer, others, tblog):
     set_seed(args)  # Added here for reproducibility
 
     skip_scheduler = False
-
-
     for epoch in train_iterator:
         ## Calculate kmeans results in the beginning of each epoch
-        loss_arr, loss_mlm_arr, loss_tri_arr, loss_rs_arr, n_distance_arr, p_distance_arr = [], [], [], [], [], []
+        loss_arr, loss_mlm_arr, loss_rs_arr = [], [], []
         trn_loader.sampler.set_epoch(epoch)
         epoch_iterator = tqdm(trn_loader, disable=args.local_rank not in [-1, 0])
         data_iter_size = len(trn_loader)
@@ -319,17 +266,10 @@ def train(args, trn_loader, dev_loader, model, tokenizer, others, tblog):
                 steps_trained_in_current_epoch -= 1
                 continue
 
-            # cont, resp, mlm, cluster_label, p_index, n_index, index
-            # input_cont, input_resp, input_mlm, label, p_index, n_index, index, p_cluster_label_list, n_cluster_label_list = batch
-            input_cont, p_resp, n_resp, input_mlm, p_cluster_label_list, n_cluster_label_list, data_idx = batch
-
-            # cont_tri, p_resp, n_resp = find_n_p(input_cont, input_resp, p_index, n_index, index, args.n_p_size, args.add_origin_in_tri, args.batch_size, args.add_origin_in_tri_rate)
-
-
+            input_cont, input_resp, input_mlm, label = batch
             if args.fp16:
                 with autocast():
-                    # loss, (loss_mlm, loss_tri, loss_rs, scores, distance_positive, distance_negative, _, _) = model(input_mlm, input_cont, input_resp, cont_tri, p_resp, n_resp, label)
-                    loss, (loss_mlm, loss_tri, loss_rs, scores, distance_positive, distance_negative, _, _) = model(input_mlm, input_cont, p_resp, n_resp, p_cluster_label_list)
+                    loss, (loss_mlm, loss_rs, scores, _, _) = model(input_mlm, input_cont, input_resp, label)
                 scale_before_step = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -339,8 +279,7 @@ def train(args, trn_loader, dev_loader, model, tokenizer, others, tblog):
 
                 skip_scheduler = scaler.get_scale() != scale_before_step
             else:
-                # loss, (loss_mlm, loss_tri, loss_rs, scores, distance_positive, distance_negative, _, _) = model(input_mlm, input_cont, input_resp, cont_tri, p_resp, n_resp, label)
-                loss, (loss_mlm, loss_tri, loss_rs, scores, distance_positive, distance_negative, _, _) = model(input_mlm, input_cont, p_resp, n_resp, p_cluster_label_list)
+                loss, (loss_mlm, loss_rs, scores, _, _) = model(input_mlm, input_cont, input_resp, label)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -349,43 +288,29 @@ def train(args, trn_loader, dev_loader, model, tokenizer, others, tblog):
             if not skip_scheduler:
                 scheduler.step()
 
-            input_mlm.to("cpu")
-
             # log
+            top1_acc, top3_acc = topk_acc(0, scores, topk=[1, 3], cluster_label=label, percent=True)
             loss_arr.append(loss.item())
             loss_mlm_arr.append(loss_mlm.item())
-            loss_tri_arr.append(loss_tri.item())
             loss_rs_arr.append(loss_rs.item())
-            top1_acc, top3_acc = topk_acc(0, scores, topk=[1, 3], cluster_label=p_cluster_label_list, percent=True)
             if args.local_rank in [-1, 0] and logging_steps > 0 and global_step % logging_steps == 0:
                 tb_scalars = [
                     ('training/lr', scheduler.get_last_lr()[0]),
                     ('training/loss', loss.item()),
                     ('training/loss_mlm', loss_mlm.item()),
-                    ('training/loss_tri', loss_tri.item()),
                     ('training/loss_rs', loss_rs.item()),
                     ('training/top1_acc', top1_acc),
                     ('training/top3_acc', top3_acc),
                     ('training/patience', patience),
                 ]
-                if p_resp is not None:
-                    distance_acc = get_acc(distance_positive, distance_negative)
-                    mean_p_distance = torch.mean(distance_positive)
-                    mean_n_distance = torch.mean(distance_negative)
-                    tb_scalars.append(("training/distance_positive", mean_p_distance))
-                    tb_scalars.append(("training/distance_negative", mean_n_distance))
-                    tb_scalars.append(("training/distance_acc", distance_acc))
-
                 tblog.add_scalars_epoch_step(tb_scalars, epoch, step, data_iter_size)
             
             ## Print loss
-            epoch_iterator.set_description("E:{:03d} Loss:{:.4f} MLM:{:.4f} TRI:{:.4f} RS:{:.4f}".format(
+            epoch_iterator.set_description("E:{:03d} Loss:{:.4f} MLM:{:.4f} RS:{:.4f}".format(
                         epoch,
                         np.mean(loss_arr),
                         np.mean(loss_mlm_arr),
-                        np.mean(loss_tri_arr),
-                        np.mean(loss_rs_arr)),
-                    )
+                        np.mean(loss_rs_arr)))
             
             tr_loss += loss.item()
             global_step += 1
@@ -428,7 +353,7 @@ def train(args, trn_loader, dev_loader, model, tokenizer, others, tblog):
     return global_step, tr_loss / global_step
 
 
-def topk_acc(idx_base, sim_scores, topk=[1, 3], cluster_label=None, percent=False, data_idx_list=None, data_idx_to_p_cluster_label_list=None):
+def topk_acc(idx_base, sim_scores, topk=[1, 3], cluster_label=None, percent=False):
     accs = []
     for k in topk:
         _, idx = sim_scores.topk(dim=-1, k=k)
@@ -437,52 +362,14 @@ def topk_acc(idx_base, sim_scores, topk=[1, 3], cluster_label=None, percent=Fals
             if cluster_label is None:
                 if i + idx_base in idx[i]:
                     acc += 1
-            elif data_idx_list is not None and data_idx_to_p_cluster_label_list is not None:
-                acc_c = 0
-                all_p_cluster_label = data_idx_to_p_cluster_label_list[data_idx_list[idx_base + i]]
-                for resp_idx in idx[i].tolist():
-                    resp_cluster_label = cluster_label[resp_idx].item()
-                    if resp_cluster_label in all_p_cluster_label:
-                        acc_c += 1
-                if acc_c != 0:
-                    acc += 1
             elif cluster_label[i+idx_base] in cluster_label[idx[i].to("cpu")]:
             # elif cluster_label[i+idx_base] in cluster_label[idx[i]]:
                 acc += 1
+
         if percent:
             acc = acc / sim_scores.shape[0]
         accs.append(acc)
     return accs
-
-def compute_eval_top_cluster_metrics(idx_base, sim_scores, cluster_label, data_idx, data_idx_to_p_cluster_label_list, data_idx_to_n_cluster_label_list):
-    acc_n_list = []
-    acc_p_list = []
-    for i in range(sim_scores.shape[0]):
-        i_tensor = sim_scores[i]
-        p_cluster_label_list = data_idx_to_p_cluster_label_list[data_idx[i]]
-        n_cluster_label_list = data_idx_to_n_cluster_label_list[data_idx[i]]
-        k_p = len(p_cluster_label_list)
-        k_n = len(n_cluster_label_list)
-        _, idx_p = i_tensor.topk(k=k_p, largest=True)
-        _, idx_n = i_tensor.topk(k=k_n, largest=False)
-        p_true_cnt = 0
-        n_true_cnt = 0
-        for idx_item in idx_p:
-            resp_idx = idx_item.item()
-            resp_cluster = cluster_label[resp_idx].item()
-            if resp_cluster in p_cluster_label_list:
-                p_true_cnt += 1
-        for idx_item in idx_n:
-            resp_idx = idx_item.item()
-            resp_cluster = cluster_label[resp_idx].item()
-            if resp_cluster in n_cluster_label_list:
-                n_true_cnt += 1
-        acc_n_list.append(n_true_cnt / len(idx_n))
-        acc_p_list.append(p_true_cnt / len(idx_p))
-    mean_p_acc = sum(acc_p_list) / len(acc_p_list)
-    mean_n_acc = sum(acc_n_list) / len(acc_n_list)
-    return mean_p_acc, mean_n_acc
-    
 
 def evaluate(args, model, eval_dataloader, tokenizer, prefix=""):
 
@@ -491,58 +378,31 @@ def evaluate(args, model, eval_dataloader, tokenizer, prefix=""):
     logging.info("  Num examples = %d", len(eval_dataloader))
     logging.info("  Batch size = %d", args.batch_size)
     batch_size = args.batch_size
-    distance_acc_list = []
     eval_loss = []
     eval_mlm_loss = []
-    eval_tri_loss = []
     eval_rs_loss = []
-    eval_p_distance = []
-    eval_n_distance = []
-
     model.eval()
     model_without_ddp = model
-
     if hasattr(model, 'module'):
         model_without_ddp = model.module
 
-    list_cont_norm, list_resp_norm = [], []
-    list_cluster_label = []
-    data_idx_to_p_cluster_label_list = {}
-    data_idx_to_n_cluster_label_list = {}
-    data_idx_list = []
-
+    list_cont_norm, list_resp_norm, list_cluster_label = [], [], []
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        # input_cont, input_resp, input_mlm, label, p_index, n_index, index, p_cluster_label_list, n_cluster_label_list = batch
-        input_cont, p_resp, n_resp, input_mlm, p_cluster_label_list, n_cluster_label_list, data_idx = batch
-        # cont_tri, p_resp, n_resp = find_n_p(input_cont, input_resp, p_index, n_index, index, args.n_p_size, args.add_origin_in_tri, args.batch_size, args.add_origin_in_tri_rate)
-
-        for i in range(len(data_idx)):
-            if data_idx[i] not in data_idx_to_p_cluster_label_list:
-                data_idx_to_p_cluster_label_list[data_idx[i]] = []
-                data_idx_to_n_cluster_label_list[data_idx[i]] = []
-            data_idx_to_p_cluster_label_list[data_idx[i]].append(p_cluster_label_list[i].item())
-            data_idx_to_n_cluster_label_list[data_idx[i]].append(n_cluster_label_list[i].item())
-
+        
+        cont, resp, input_mlm, label = batch
+        
         with torch.no_grad():
-            # loss, (loss_mlm, loss_tri, loss_rs, scores, distance_positive, distance_negative, hid_cont, hid_resp) = model(input_mlm, input_cont, input_resp, cont_tri, p_resp, n_resp, label)
-            loss, (loss_mlm, loss_tri, loss_rs, scores, distance_positive, distance_negative, hid_cont, hid_resp) = model(input_mlm, input_cont, p_resp, n_resp, p_cluster_label_list)
+            loss, (loss_mlm, loss_rs, scores, hid_cont, hid_resp) = model_without_ddp(input_mlm, cont, resp, label)
 
-            list_cluster_label.append(p_cluster_label_list)
+            list_cluster_label.append(label)
             list_cont_norm.append(hid_cont)
             list_resp_norm.append(hid_resp)
-
-            data_idx_list.extend(data_idx)
-
             eval_loss.append(loss.item())
             eval_mlm_loss.append(loss_mlm.item())
             eval_rs_loss.append(loss_rs.item())
 
-            distance_acc = get_acc(distance_positive, distance_negative)
-            distance_acc_list.append(distance_acc)
-            eval_p_distance.append(torch.mean(distance_positive).item())
-            eval_n_distance.append(torch.mean(distance_negative).item())
-            eval_tri_loss.append(loss_tri.item())
 
+    # eval
     cluster_label = torch.cat(list_cluster_label, dim=0)
     cont_norm = torch.cat(list_cont_norm, dim=0)
     resp_norm = torch.cat(list_resp_norm, dim=0)
@@ -552,41 +412,18 @@ def evaluate(args, model, eval_dataloader, tokenizer, prefix=""):
     topk_acc_list = [[] for _ in topks]
     idx_base = 0
 
-    # compute_eval_top_cluster_metrics(idx_base, sim_scores, cluster_label, list_p_cluster_label_list, list_n_cluster_label_list)
-    p_acc_list = []
-    n_acc_list = []
     for i in range(0, data_size, batch_size):
         cur_batch = cont_norm[i:i+batch_size]
         scores = torch.matmul(cur_batch, resp_norm.transpose(1, 0))
-        acc_list = topk_acc(
-                idx_base,
-                scores,
-                topk=topks,
-                cluster_label=cluster_label,
-                data_idx_list=data_idx_list,
-                data_idx_to_p_cluster_label_list=data_idx_to_p_cluster_label_list
-                )
-        p_acc, n_acc = compute_eval_top_cluster_metrics(
-                            idx_base,
-                            scores,
-                            cluster_label,
-                            data_idx_list[i:i+batch_size],
-                            data_idx_to_p_cluster_label_list,
-                            data_idx_to_n_cluster_label_list
-                )
-        p_acc_list.append(p_acc)
-        n_acc_list.append(n_acc)
+        acc_list = topk_acc(idx_base, scores, topk=topks, cluster_label=cluster_label)
         idx_base += cur_batch.shape[0]
 
         for accs, acc in zip(topk_acc_list, acc_list):
             accs.append(acc)
 
-    # eval
     eval_loss = np.mean(eval_loss)
     eval_mlm_loss = np.mean(eval_mlm_loss)
     eval_rs_loss = np.mean(eval_rs_loss)
-    eval_p_acc = np.mean(p_acc_list)
-    eval_n_acc = np.mean(n_acc_list)
 
     top_accs = []
     for accs in topk_acc_list:
@@ -596,28 +433,11 @@ def evaluate(args, model, eval_dataloader, tokenizer, prefix=""):
     perplexity = torch.exp(torch.tensor(eval_mlm_loss))
 
     result = dict(
-            perplexity        = perplexity.item(),
-            loss              = eval_loss,
-            mlm_loss          = eval_mlm_loss,
-            # tri_loss          = eval_tri_loss,
-            rs_loss           = eval_rs_loss,
-            eval_p_acc        = eval_p_acc,
-            eval_n_acc        = eval_n_acc,
-            # distance_positive = eval_p_distance,
-            # distance_negative = eval_n_distance,
-            # distance_acc      = distance_mean_acc,
+            perplexity  = perplexity,
+            loss        = eval_loss,
+            mlm_loss    = eval_mlm_loss,
+            rs_loss     = eval_rs_loss,
     )
-
-    if len(eval_p_distance) > 0:
-        eval_tri_loss = np.mean(eval_tri_loss)
-        eval_p_distance = np.mean(eval_p_distance)
-        eval_n_distance = np.mean(eval_n_distance)
-        tensor_avg = torch.stack(distance_acc_list)
-        distance_mean_acc = torch.mean(tensor_avg).item()
-        result["distance_positive"] = eval_p_distance
-        result["distance_negative"] = eval_n_distance
-        result["distance_acc"] = distance_mean_acc
-        result["tri_loss"] = eval_tri_loss
 
     for ti, k in enumerate(topks):
         result[f'top{k}_acc'] = top_accs[ti]
@@ -632,22 +452,27 @@ def evaluate(args, model, eval_dataloader, tokenizer, prefix=""):
     return result
 
 
-def batch_pad_collector_tagged_tri(batch: List[Tuple[List[int], List[int], List[int], List[int], int, int, int]], pad_val=0):
-    # (cont_id[:510], p_resp_id[:510], n_resp_id[:510], mlm_id[:510], p_cluster_label, n_cluster_label, cont_idx)
-    items = [[], [], [], [], [], [], []]
-    batch_size = len(batch)
-    for i in range(batch_size):
-        items[0].append(torch.tensor(batch[i][0])) # cont_id
-        items[1].append(torch.tensor(batch[i][1])) # p_resp_id
-        items[2].append(torch.tensor(batch[i][2])) # n_resp_id
-        items[3].append(torch.tensor(batch[i][3])) # mlm_id
-        items[4].append(batch[i][4]) # p_cluster_label
-        items[5].append(batch[i][5]) # n_cluster_label
-        items[6].append(batch[i][6]) # data_idx
-    items[:4] = [pad_sequence(item, batch_first=True, padding_value=pad_val) for item in items[:4]]
-    items[4] = torch.tensor(items[4])
-    items[5] = torch.tensor(items[5])
-    return items
+def load_tri_dataset(data_path, rate=0.1):
+    # 'cont_id', 'p_resp_id', 'n_resp_id'
+    jf = open(data_path, "r")
+    tri_data = json.load(jf)
+    jf.close()
+
+    data_size = len(tri_data["cont_id"])
+    random_idx = [i for i in range(data_size)]
+    random.shuffle(random_idx)
+    val_len = int(rate * data_size)
+    val_idx = random_idx[:val_len]
+    train_idx = random_idx[val_len:]
+    val_dataset = [(tri_data["cont_id"][index], tri_data["p_resp_id"][index], tri_data["n_resp_id"][index], tri_data["mlm_id"][index]) for index in val_idx]
+    train_dataset = [(tri_data["cont_id"][index], tri_data["p_resp_id"][index], tri_data["n_resp_id"][index], tri_data["mlm_id"][index]) for index in train_idx]
+    return val_dataset, train_dataset
+
+
+def save_star_list(star_list, dst_path):
+    with open(dst_path, 'w+') as fout:
+        for star in star_list:
+            fout.write(star + '\n')
 
 
 def main():
@@ -675,15 +500,16 @@ def main():
     parser.add_argument(
         "--mlm_probability", type=float, default=0.15, help="Ratio of tokens to mask for masked language modeling loss"
     )
-    parser.add_argument( "--tokenizer_name",
+    parser.add_argument(
+        "--tokenizer_name",
         default="",
         type=str,
         help="Optional pretrained tokenizer name or path if not the same as model_name_or_path",
     )
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
-    parser.add_argument("--train_data_path", default="./data/tri_train/train.json", help="The path to the training")
-    parser.add_argument("--valid_data_path", default="./data/tri_train/valid.json", help="The path to the training")
+    parser.add_argument("--use_triplet_loss", action="store_true", help="Use triplet loss for training.")
+    parser.add_argument("--tri_data_path", default="./data/tri_train/train.json", help="The path to the training")
     parser.add_argument('--topk', type=int, default=[1, 3, 5, 10, 20, 50], nargs='+', help="default: [1, 3, 5, 10, 20, 50]")
     parser.add_argument(
         "--evaluate_during_training", action="store_true", help="Run evaluation during training at each logging step."
@@ -738,20 +564,13 @@ def main():
     parser.add_argument('--min_sess_size', help='gen msc segmentation with min session size, default=5', type=int, default=5)
     parser.add_argument('--first_orders', help='Only take the first few orders between the same user and advisor, default=5', type=int, default=5)
     parser.add_argument('--num_workers', type=int, default=4, help="dataloader worker num, default: 2")
-    parser.add_argument("--margin", type=float, default=2.0, help="margin for triplet loss")
     parser.add_argument("--log_dir", type=str, default="logs/", help="logs dir")
-    parser.add_argument("--n_p_size", type=int, default=1, help="the negative samples cnt in a batch.")
-    parser.add_argument("--add_origin_in_tri", action="store_true", help="Whether to add the origin resp in triplet loss.")
-    parser.add_argument("--add_origin_in_tri_rate", type=float, default=0.5, help="if add the origin into tri, the rate should be set.")
-    parser.add_argument("--use_triplet_loss", action="store_true", help="whether to use triplet_loss or not.")
-    parser.add_argument("--use_rs_loss", action="store_true", help="whether to use rs_loss or not.")
 
     parser.add_argument(
         "--patience", 
         type=int, 
         default=500, 
-        help="waiting to earlystop"
-    )
+        help="waiting to earlystop")
     
     args = parser.parse_args()
     print(args)
@@ -759,7 +578,7 @@ def main():
     tblog = None
     if misc.is_main_process():
         import datetime
-        tb_log_dir = args.output_dir + args.log_dir + datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+        tb_log_dir = args.output_dir + args.log_dir+ datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         if not os.path.exists(args.output_dir + args.log_dir):
             os.makedirs(args.output_dir + args.log_dir)
         os.makedirs(tb_log_dir)
@@ -784,15 +603,8 @@ def main():
         torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training download model & vocab
 
     tokenizer = get_dialog_tokenizer(args.model_type, args.tokenizer_name or args.model_name_or_path)
-    model = MLMBiencoder(
-            args.model_name_or_path,
-            tokenizer,
-            mlm_probability=args.mlm_probability,
-            mlm=args.mlm,
-            margin=args.margin,
-            use_triplet_loss=args.use_triplet_loss,
-            use_rs_loss=args.use_rs_loss,
-            )
+    model = MLMBiencoder(args.model_name_or_path, tokenizer,
+            mlm_probability=args.mlm_probability, mlm=args.mlm)
     model.to(args.device)
     
     if args.local_rank == 0:
@@ -801,61 +613,48 @@ def main():
 
     pre_star_list = load_star_list(args.star_list_file)
 
-    train_dataset  = load_tagged_tri_dataset(
-            args.train_data_path,
-    )
-    val_dataset  = load_tagged_tri_dataset(
-            args.valid_data_path,
-    )
-
-    collator = batch_pad_collector_tagged_tri
-
+    if args.use_triplet_loss:
+        train_dataset, val_dataset = load_tri_dataset(
+                args.tri_data_path,
+                rate = 0.1, 
+        )
+        collator = batch_pad_collector_tri
+    else:
+        train_dataset, val_dataset, star_list = load_datasets(
+                args.order_file,
+                first_orders=args.first_orders,
+                max_sess_size=args.max_sess_size,
+                min_sess_size=args.min_sess_size,
+                tokenizer=tokenizer,
+                data_type='msc_mlm_biencoder_cat',
+                star_list=pre_star_list,
+        )
+        collator = batch_pad_collector
     ## Create Dataloader
-    # sampler = NaiveIdentitySampler(
-    #         data_source     = train_dataset,
-    #         mini_batch_size = args.batch_size,
-    #         num_instances   = int(args.batch_size / 2),
-    #         )
-
-    # n_size is deprecated here
-    train_sampler = RankingTaggedNegativeTripletSampler(
-            dataset    = train_dataset,
-            batch_size = args.batch_size,
-            shuffle    = True,
-            seed       = args.seed,
-            drop_last  = True,
-            )
-
-    dev_sampler = RankingTaggedNegativeTripletSampler(
-            dataset    = val_dataset,
-            batch_size = args.batch_size,
-            shuffle    = False,
-            seed       = args.seed,
-            drop_last  = True,
-            )
-
     trn_loader = DataLoader(
             dataset     = train_dataset,
-            # sampler     = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=misc.get_rank(), shuffle=True),
-            sampler     = train_sampler,
+            sampler     = DistributedSampler(train_dataset, num_replicas=args.world_size,
+                    rank=misc.get_rank(), shuffle=True),
             batch_size  = args.batch_size,
             num_workers = args.num_workers,
             drop_last   = True,
-            collate_fn  = collator
-            )
+            collate_fn  = collator)
 
     # hujun exploring the effect of the data collator.
     # test_dataloader(trn_loader, model.tokenizer, is_training=True)
 
     dev_loader = DataLoader(
             dataset     = val_dataset,
-            # sampler     = SequentialSampler(val_dataset),
-            sampler     = dev_sampler,
+            sampler     = SequentialSampler(val_dataset),
             batch_size  = args.batch_size,
             num_workers = args.num_workers,
             drop_last   = True,
             collate_fn  = collator
             )
+
+
+    # hujun exploring the effect of the data collator.
+    # test_dataloader(dev_loader, model.tokenizer, is_training=False)
 
     # Training
     if args.do_train:
@@ -864,6 +663,10 @@ def main():
         # and the others will use the cache
 #        if args.local_rank not in [-1, 0]:
 #            torch.distributed.barrier()  
+
+        if not args.use_triplet_loss:
+            save_star_list(star_list, os.path.join(args.output_dir, 'star_list.txt'))
+
         ## additional information for negative sampling
         others = {}
 
@@ -878,7 +681,6 @@ def main():
         )
         logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
-        result = evaluate(args, model, dev_loader, tokenizer)
         for checkpoint in checkpoints:
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
@@ -888,7 +690,7 @@ def main():
             result = evaluate(args, model, dev_loader, tokenizer, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
-
+    
     print(results)
 
 

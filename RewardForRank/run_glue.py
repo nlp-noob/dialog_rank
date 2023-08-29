@@ -37,6 +37,7 @@ import evaluate
 import transformers
 
 from trainer import Trainer
+from special_tokens import ATTR_TO_SPECIAL_TOKEN
 
 # from data_collator import default_data_collator
 from transformers import (
@@ -385,6 +386,7 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    tokenizer.add_special_tokens(ATTR_TO_SPECIAL_TOKEN)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -394,6 +396,7 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
         ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
     )
+    model.resize_token_embeddings(len(tokenizer))
     # import pdb;pdb.set_trace()
 
     # Preprocessing the raw_datasets

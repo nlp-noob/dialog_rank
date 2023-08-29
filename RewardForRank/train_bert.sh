@@ -1,8 +1,8 @@
-CUDA_VISIBLE_DEVICES=1 python run_glue.py \
+CUDA_VISIBLE_DEVICES=0 python run_glue.py \
   --my_train_file ./data/train_v1.json.win10 \
   --my_validataion_file ./data/valid_v1.json.win10 \
   --label_info_path label_info.json \
-  --model_name_or_path distilbert-base-uncased \
+  --model_name_or_path bert-base-uncased \
   --task_name rte \
   --do_train True \
   --do_eval True \
@@ -18,7 +18,7 @@ CUDA_VISIBLE_DEVICES=1 python run_glue.py \
   --eval_steps 1500 \
   --overwrite_output_dir True \
   --output_dir ./tmp/sst2/ \
-  --logging_dir ./tmp/sst2/win10_distilbert \
+  --logging_dir ./tmp/sst2/win10_bert \
   --ignore_mismatched_sizes True \
   --fp16 True \
   --fp16_opt_level O1 \
@@ -26,12 +26,12 @@ CUDA_VISIBLE_DEVICES=1 python run_glue.py \
   --warmup_ratio 0.20 \
   --save_strategy epoch \
   --save_steps 1 \
-  --save_model_path ./tmp/win10_distilbert/
-CUDA_VISIBLE_DEVICES=1 python run_glue.py \
+  --save_model_path ./tmp/win10_bert/
+CUDA_VISIBLE_DEVICES=0 python run_glue.py \
   --my_train_file ./data/train_v1.json.win5 \
   --my_validataion_file ./data/valid_v1.json.win5 \
   --label_info_path label_info.json \
-  --model_name_or_path distilbert-base-uncased \
+  --model_name_or_path bert-base-uncased \
   --task_name rte \
   --do_train True \
   --do_eval True \
@@ -47,7 +47,7 @@ CUDA_VISIBLE_DEVICES=1 python run_glue.py \
   --eval_steps 1500 \
   --overwrite_output_dir True \
   --output_dir ./tmp/sst2/ \
-  --logging_dir ./tmp/sst2/win5_distilbert \
+  --logging_dir ./tmp/sst2/win5_bert \
   --ignore_mismatched_sizes True \
   --fp16 True \
   --fp16_opt_level O1 \
@@ -55,12 +55,12 @@ CUDA_VISIBLE_DEVICES=1 python run_glue.py \
   --warmup_ratio 0.20 \
   --save_strategy epoch \
   --save_steps 1 \
-  --save_model_path ./tmp/win5_distilbert/
-CUDA_VISIBLE_DEVICES=1 python run_glue.py \
+  --save_model_path ./tmp/win5_bert/
+CUDA_VISIBLE_DEVICES=0 python run_glue.py \
   --my_train_file ./data/train_v1.json.win20 \
   --my_validataion_file ./data/valid_v1.json.win20 \
   --label_info_path label_info.json \
-  --model_name_or_path distilbert-base-uncased \
+  --model_name_or_path bert-base-uncased \
   --task_name rte \
   --do_train True \
   --do_eval True \
@@ -76,7 +76,7 @@ CUDA_VISIBLE_DEVICES=1 python run_glue.py \
   --eval_steps 1500 \
   --overwrite_output_dir True \
   --output_dir ./tmp/sst2/ \
-  --logging_dir ./tmp/sst2/win20_distilbert \
+  --logging_dir ./tmp/sst2/win20_bert \
   --ignore_mismatched_sizes True \
   --fp16 True \
   --fp16_opt_level O1 \
@@ -84,4 +84,4 @@ CUDA_VISIBLE_DEVICES=1 python run_glue.py \
   --warmup_ratio 0.20 \
   --save_strategy epoch \
   --save_steps 1 \
-  --save_model_path ./tmp/win20_distilbert/ \
+  --save_model_path ./tmp/win20_bert/ \

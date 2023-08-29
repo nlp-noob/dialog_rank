@@ -5,14 +5,11 @@ import json
 from typing import List, Dict, Optional, Union, Tuple
 import os
 
-from triplet_loss import TripletLoss
-
 
 class MLMBiencoder(nn.Module):
     def __init__(self, model_name_or_path: str, tokenizer: AutoTokenizer = None,
             model_args: Dict = {}, cache_dir: Optional[str] = None,
-            mlm_probability: Optional[float]=None, mlm: Optional[bool]=True, margin: Optional[float]=1.0, 
-            use_triplet_loss: Optional[bool]=True, use_rs_loss: Optional[bool]=True):
+            mlm_probability: Optional[float]=None, mlm: Optional[bool]=True):
         super().__init__()
         self.model_name_or_path = model_name_or_path
         config = AutoConfig.from_pretrained(model_name_or_path, **model_args, cache_dir=cache_dir)
@@ -22,8 +19,6 @@ class MLMBiencoder(nn.Module):
         self.config = config
         self.mlm_probability = mlm_probability or 0.15
         self.sim_scale = 20
-        self.use_triplet_loss = use_triplet_loss
-        self.use_rs_loss = use_rs_loss
 
         hidden_size = config.hidden_size
         vocab_size = config.vocab_size
@@ -35,7 +30,6 @@ class MLMBiencoder(nn.Module):
                 nn.Linear(hidden_size, vocab_size)
             )
         self.device = torch.device('cpu')
-        self.margin = margin
 
     def to(self, device):
         self.device = device
@@ -121,12 +115,12 @@ class MLMBiencoder(nn.Module):
 
         return loss_mlm, sentence_embed
 
-    # model(input_mlm, input_cont, p_resp, n_resp, p_cluster_label_list
-    def forward(self, input_mlm, cont, p_resp, n_resp, p_cluster_label_list):
+    def forward(self, input_mlm, cont, resp, label):
         if self.mlm:
             input_mlm, labels = self.mask_tokens(input_mlm.clone(), self.mlm_probability)
             input_mlm = input_mlm.to(self.device)
             labels = labels.to(self.device)
+
             loss_mlm, _ = self.encoder_forward(
                     input_ids       = input_mlm,
                     attention_mask  = input_mlm > 0,
@@ -134,43 +128,12 @@ class MLMBiencoder(nn.Module):
             )
         else:
             loss_mlm = torch.tensor(0.0)
-        ###################################################################################
-        ## Calculate the RS loss
-        cont = cont.to(self.device)
-        p_resp = p_resp.to(self.device)
 
-        _, hid_cont = self.encoder_forward(
-                input_ids       = cont,
-                attention_mask  = cont > 0,
-        )
-
-        _, hid_p_resp = self.encoder_forward(
-                input_ids       = p_resp,
-                attention_mask  = p_resp > 0,
-        )
-        # the embeddings of the sentences
-        hid_cont = torch.nn.functional.normalize(hid_cont, p=2, dim=1)
-        hid_p_resp = torch.nn.functional.normalize(hid_p_resp, p=2, dim=1)
-
-        # triplet loss with distance
-        # distance_positive = (hid_cont - hid_p_resp).pow(2).sum(1) 
-        # distance_negative = (hid_cont - hid_n_resp).pow(2).sum(1) 
-        # loss_tri = torch.mean(torch.relu(distance_positive - distance_negative + self.margin))
-
-        # triplet_loss = nn.TripletMarginLoss(margin=self.margin, p=2)
-        # loss_tri = triplet_loss(hid_cont, hid_p_resp, hid_n_resp)
-
-        loss_tri = torch.tensor(0)
-        distance_positive = torch.tensor(0)
-        distance_negative = torch.tensor(0)
-
-        scores = torch.matmul(hid_cont, hid_p_resp.transpose(1, 0)) * self.sim_scale
-        xeloss = nn.CrossEntropyLoss()
-
-        batch_size = cont.shape[0]
-
+        # rs loss
+        # transfer cluster label to rs label
+        batch_size = resp.shape[0]
         resp_label = torch.arange(batch_size, device=self.device)
-        if len(set(p_cluster_label_list)) < batch_size:
+        if len(set(label.tolist())) < batch_size:
             duplicate_set = set()
             for i in range(batch_size):
                 tmp = label[i].item()
@@ -179,42 +142,36 @@ class MLMBiencoder(nn.Module):
                     continue
                 # ignore duplicate
                 resp_label[i] = -100
-        loss_rs = xeloss(scores, resp_label)
 
-        ###################################################################################
-        ## Calculate Triplet loss
-        _, hid_n_resp = self.encoder_forward(
-                input_ids       = n_resp,
-                attention_mask  = n_resp > 0,
+        cont = cont.to(self.device)
+        resp = resp.to(self.device)
+
+        _, hid_cont = self.encoder_forward(
+                input_ids       = cont,
+                attention_mask  = cont > 0,
         )
-        hid_p_resp = torch.nn.functional.normalize(hid_p_resp, p=2, dim=1)
-        hid_n_resp = torch.nn.functional.normalize(hid_n_resp, p=2, dim=1)
-        distance_positive = (hid_cont - hid_p_resp).pow(2).sum(1) 
-        distance_negative = (hid_cont - hid_n_resp).pow(2).sum(1) 
-        triplet_loss = nn.TripletMarginLoss(margin=self.margin, p=2)
-        loss_tri = triplet_loss(hid_cont, hid_p_resp, hid_n_resp)
 
-        if self.use_triplet_loss and self.use_rs_loss:
-            loss = loss_tri + loss_mlm + loss_rs
-        elif self.use_triplet_loss and not self.use_rs_loss:
-            loss = loss_tri + loss_mlm
-        elif self.use_rs_loss and not self.use_triplet_loss:
-            loss = loss_mlm + loss_rs
+        _, hid_resp = self.encoder_forward(
+                input_ids       = resp,
+                attention_mask  = resp > 0,
+        )
 
-        return loss, (loss_mlm, loss_tri, loss_rs, scores, distance_positive, distance_negative, hid_cont, hid_p_resp)
-        
+        ## Calculate RCL loss
+        hid_cont = torch.nn.functional.normalize(hid_cont, p=2, dim=1)
+        hid_resp = torch.nn.functional.normalize(hid_resp, p=2, dim=1)
+        scores = torch.matmul(hid_cont, hid_resp.transpose(1, 0)) * self.sim_scale
+        xeloss = nn.CrossEntropyLoss()
+        loss_rs = xeloss(scores, resp_label)
+        loss = loss_rs + loss_mlm
+
+        return loss, (loss_mlm, loss_rs, scores, hid_cont, hid_resp)
+
 
 def test():
     import sys
     model_name_or_path = sys.argv[1]
     device = torch.device('cuda:0')
     model = MLMBiencoder(model_name_or_path)
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    num_params = count_parameters(model)
-    print("Number of parameters:", num_params)
-
-    import pdb;pdb.set_trace()
     model.to(device)
     sample_str = 'hello world, this is a test example for model forward! please check it when failed'
     inputs = model.tokenizer(sample_str, return_tensors="pt")
